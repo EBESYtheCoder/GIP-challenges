@@ -1,6 +1,7 @@
-import { createApp } from './app.js';
-import { createStore } from './store.js';
+import app from './app.js';
 
-const app = createApp(createStore());
-const port = Number(process.env.PORT || 3000);
-app.listen(port, () => console.log(`Lost & Found API: http://localhost:${port}`));
+const port = 3000;
+
+app.listen(port, () => {
+  console.log(`Server running at http://localhost:${port}`);
+});

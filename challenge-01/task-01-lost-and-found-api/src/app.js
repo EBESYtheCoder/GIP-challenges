@@ -1,129 +1,136 @@
 import express from 'express';
-import { randomUUID, randomBytes, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { readReports, saveReports } from './store.js';
 
-// Store a hash of the edit key, not the key itself.
-const hash = key => createHash('sha256').update(key).digest('hex');
+const app = express();
+app.use(express.json());
 
-// Never include the private edit-key hash in a public response.
+// Remove the private edit key before sending a report to the public.
 function publicReport(report) {
-  const { editKeyHash, ...details } = report;
-  return details;
+  const { editKey, ...reportWithoutKey } = report;
+  return reportWithoutKey;
 }
 
-// Return an error message if the submitted fields are invalid.
-function validate(body, partial = false) {
+function validReport(body) {
+  return body
+    && ['lost', 'found'].includes(body.type)
+    && body.title?.trim()
+    && body.description?.trim()
+    && body.category?.trim()
+    && body.location?.trim();
+}
+
+app.get('/', (req, res) => {
+  res.json({ message: 'Lost & Found API' });
+});
+
+// Get all reports. The query parameters are optional filters.
+app.get('/api/reports', (req, res) => {
+  let reports = readReports();
+
+  if (req.query.search) {
+    const search = req.query.search.toLowerCase();
+    reports = reports.filter(report =>
+      report.title.toLowerCase().includes(search)
+      || report.description.toLowerCase().includes(search),
+    );
+  }
+
+  for (const field of ['type', 'category', 'location', 'status']) {
+    if (req.query[field]) {
+      reports = reports.filter(report =>
+        report[field].toLowerCase() === req.query[field].toLowerCase(),
+      );
+    }
+  }
+
+  res.json(reports.map(publicReport));
+});
+
+// Get one report by its ID.
+app.get('/api/reports/:id', (req, res) => {
+  const report = readReports().find(report => report.id === req.params.id);
+  if (!report) return res.status(404).json({ error: 'Report not found' });
+  res.json(publicReport(report));
+});
+
+// Create a new lost or found report.
+app.post('/api/reports', (req, res) => {
+  if (!validReport(req.body)) {
+    return res.status(400).json({ error: 'Please provide type, title, description, category and location' });
+  }
+
+  const report = {
+    id: randomUUID(),
+    type: req.body.type,
+    title: req.body.title.trim(),
+    description: req.body.description.trim(),
+    category: req.body.category.trim(),
+    location: req.body.location.trim(),
+    status: 'open',
+    createdAt: new Date().toISOString(),
+    editKey: randomUUID(),
+  };
+
+  const reports = readReports();
+  reports.push(report);
+  saveReports(reports);
+
+  // The edit key is returned only when the report is created.
+  res.status(201).json({ report: publicReport(report), editKey: report.editKey });
+});
+
+// Check that a report exists and that its edit key is correct.
+function findOwnedReport(req, res, next) {
+  const reports = readReports();
+  const report = reports.find(report => report.id === req.params.id);
+
+  if (!report) return res.status(404).json({ error: 'Report not found' });
+  if (req.get('X-Edit-Key') !== report.editKey) {
+    return res.status(403).json({ error: 'Wrong edit key' });
+  }
+
+  req.reports = reports;
+  req.report = report;
+  next();
+}
+
+// Update the details of your report.
+app.patch('/api/reports/:id', findOwnedReport, (req, res) => {
+  if (req.report.status === 'recovered') {
+    return res.status(400).json({ error: 'A recovered report cannot be edited' });
+  }
+
   const fields = ['type', 'title', 'description', 'category', 'location'];
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'Send a JSON object.';
-  if (!Object.keys(body).length) return 'Provide at least one field.';
-  if (Object.keys(body).some(field => !fields.includes(field))) return 'An unknown field was supplied.';
+  const sentFields = fields.filter(field => req.body[field] !== undefined);
+
+  if (sentFields.length === 0) {
+    return res.status(400).json({ error: 'Send at least one report field' });
+  }
+
+  for (const field of sentFields) {
+    if (typeof req.body[field] !== 'string' || !req.body[field].trim()) {
+      return res.status(400).json({ error: `${field} must contain text` });
+    }
+  }
+
+  if (req.body.type && !['lost', 'found'].includes(req.body.type)) {
+    return res.status(400).json({ error: 'Type must be lost or found' });
+  }
+
   for (const field of fields) {
-    if (partial && !Object.hasOwn(body, field)) continue;
-    if (typeof body[field] !== 'string' || !body[field].trim()) return `${field} is required and must be text.`;
-    if (body[field].length > 1000) return `${field} must be at most 1000 characters.`;
-  }
-  if (body.type !== undefined && !['lost', 'found'].includes(body.type)) return 'type must be lost or found.';
-  return null;
-}
-
-export function createApp(store) {
-  const app = express();
-  app.disable('x-powered-by');
-  app.set('query parser', 'simple');
-  app.use(express.json({ limit: '10kb' }));
-  app.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
-
-  app.get('/', (req, res) => res.json({ message: 'Lost & Found API', reports: '/api/reports' }));
-
-  // 1. Read all reports, optionally searching/filtering them.
-  app.get('/api/reports', (req, res) => {
-    const allowed = ['search', 'type', 'category', 'location', 'status'];
-    for (const [key, value] of Object.entries(req.query)) {
-      if (!allowed.includes(key) || typeof value !== 'string' || value.length > 1000) {
-        return res.status(400).json({ error: 'Use the supported filters once each, with text values.' });
-      }
-    }
-    if (req.query.type && !['lost', 'found'].includes(req.query.type)) return res.status(400).json({ error: 'type must be lost or found.' });
-    if (req.query.status && !['open', 'recovered'].includes(req.query.status)) return res.status(400).json({ error: 'status must be open or recovered.' });
-    let reports = store.read();
-    if (req.query.search) {
-      const search = req.query.search.toLowerCase();
-      reports = reports.filter(item => `${item.title} ${item.description}`.toLowerCase().includes(search));
-    }
-    for (const field of ['type', 'category', 'location', 'status']) {
-      if (req.query[field]) reports = reports.filter(item => item[field].toLowerCase() === req.query[field].toLowerCase());
-    }
-    res.json(reports.map(publicReport));
-  });
-
-  // 2. Read one report.
-  app.get('/api/reports/:id', (req, res) => {
-    const report = store.read().find(item => item.id === req.params.id);
-    if (!report) return res.status(404).json({ error: 'Report not found.' });
-    res.json(publicReport(report));
-  });
-
-  // 3. Create a lost or found report. Save the returned editKey!
-  app.post('/api/reports', (req, res) => {
-    const error = validate(req.body);
-    if (error) return res.status(400).json({ error });
-    const editKey = randomBytes(32).toString('hex');
-    const report = {
-      id: randomUUID(),
-      type: req.body.type,
-      title: req.body.title.trim(),
-      description: req.body.description.trim(),
-      category: req.body.category.trim(),
-      location: req.body.location.trim(),
-      status: 'open',
-      createdAt: new Date().toISOString(),
-      editKeyHash: hash(editKey),
-    };
-    const reports = store.read();
-    reports.push(report);
-    store.save(reports);
-    res.status(201).location(`/api/reports/${report.id}`).json({ report: publicReport(report), editKey });
-  });
-
-  // Both update routes use the same ownership check.
-  function findOwnedReport(req, res, next) {
-    const reports = store.read();
-    const report = reports.find(item => item.id === req.params.id);
-    if (!report) return res.status(404).json({ error: 'Report not found.' });
-    const key = req.get('X-Edit-Key');
-    if (!key) return res.status(401).json({ error: 'Provide your report’s X-Edit-Key header.' });
-    if (hash(key) !== report.editKeyHash) return res.status(403).json({ error: 'This edit key does not own this report.' });
-    req.reports = reports;
-    req.report = report;
-    next();
+    if (req.body[field] !== undefined) req.report[field] = req.body[field].trim();
   }
 
-  // 4. Edit selected fields of your report.
-  app.patch('/api/reports/:id', findOwnedReport, (req, res) => {
-    const error = validate(req.body, true);
-    if (error) return res.status(400).json({ error });
-    if (req.report.status === 'recovered') return res.status(409).json({ error: 'Recovered reports cannot be edited.' });
-    for (const [field, value] of Object.entries(req.body)) req.report[field] = value.trim();
-    store.save(req.reports);
-    res.json(publicReport(req.report));
-  });
+  saveReports(req.reports);
+  res.json(publicReport(req.report));
+});
 
-  // 5. Mark your report recovered. Repeating this request is safe.
-  app.patch('/api/reports/:id/status', findOwnedReport, (req, res) => {
-    if (!req.body || req.body.status !== 'recovered' || Object.keys(req.body).length !== 1) {
-      return res.status(400).json({ error: 'Send only { "status": "recovered" }.' });
-    }
-    req.report.status = 'recovered';
-    store.save(req.reports);
-    res.json(publicReport(req.report));
-  });
+// Mark your item as recovered.
+app.patch('/api/reports/:id/status', findOwnedReport, (req, res) => {
+  req.report.status = 'recovered';
+  saveReports(req.reports);
+  res.json(publicReport(req.report));
+});
 
-  app.use((req, res) => res.status(404).json({ error: 'Endpoint not found.' }));
-  app.use((error, req, res, next) => {
-    if (res.headersSent) return next(error);
-    if (error.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON.' });
-    if (error.type === 'entity.too.large') return res.status(413).json({ error: 'Request body is too large.' });
-    console.error(error.message);
-    res.status(500).json({ error: 'Could not complete the request.' });
-  });
-  return app;
-}
+export default app;
