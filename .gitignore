@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+coverage/
+.DS_Store
+
+# Local verification files
+test/
+tests/
+
+# Local documentation
+*.md
+*.markdown
