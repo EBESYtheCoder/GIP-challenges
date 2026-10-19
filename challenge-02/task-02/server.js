@@ -8,7 +8,7 @@ const users = [];
 const secret = process.env.JWT_SECRET;
 
 if (!secret) {
-  throw new Error('Set JWT_SECRET before starting the server');
+  throw new Error('Set JWT_SECRET');
 }
 
 app.use(express.json());
